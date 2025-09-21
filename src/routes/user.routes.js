@@ -1,5 +1,5 @@
 const express = require('express');
-const { signup, login, profile, verifyEmail, forgotPassword, resetPassword } = require('../controllers/user.controller');
+const { signup, login, profile, verifyEmail, forgotPassword, resetPassword, socialAuthController, refreshTokenController } = require('../controllers/user.controller');
 const { signupSchema, loginSchema } = require('../utils/user.validation');
 const validate = require('../middleware/validate');
 const authenticate = require('../middleware/auth');
@@ -12,5 +12,6 @@ router.get('/profile', authenticate, profile);
 router.get('/verify-email', verifyEmail);
 router.post("/forgot-password", forgotPassword);
 router.post("/reset-password", resetPassword);
-
+router.post("/:provider", socialAuthController);
+router.post("/refresh-token", refreshTokenController);
 module.exports = router;

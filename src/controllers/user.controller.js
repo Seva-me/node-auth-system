@@ -1,10 +1,14 @@
 const bcrypt = require('bcryptjs');
 const User = require('../models/user.model');
-const { generateToken } = require('../utils/jwt');
+const { generateAccessToken, generateRefreshToken } = require('../utils/jwt');
 const asyncHandler = require('../utils/asyncHandler');
 const AppError = require('../utils/AppError');
 const crypto = require('crypto');
 const sendEmail = require('../utils/email');
+const axios = require('axios');
+const jwt = require("jsonwebtoken");
+const providers = require('../../config/oauthProviders');
+const { exchangeCodeForToken, getUserProfile } = require("../utils/oauthUtils");
 
 
 /**
@@ -80,8 +84,8 @@ const login = asyncHandler(async (req, res, next) => {
   }
 
   // 3. Generate JWT
-  const token = generateToken(user);
-
+  const accessToken = generateAccessToken(user);
+  const refreshToken = generateRefreshToken(user)
   // 4. Response
   res.status(200).json({
     status: 'success',
@@ -91,7 +95,8 @@ const login = asyncHandler(async (req, res, next) => {
       name: user.name,
       email: user.email,
     },
-    token,
+    accessToken,
+    refreshToken,
   });
 });
 
@@ -102,6 +107,7 @@ const login = asyncHandler(async (req, res, next) => {
  */
 const profile = asyncHandler(async (req, res, next) => {
   console.log("inside profile")
+  console.log("req.user : ", req.user)
   // req.user comes from protect middleware
   const user = await User.findById(req.user.userId).select('-password -__v');
   if (!user) {
@@ -120,22 +126,30 @@ const profile = asyncHandler(async (req, res, next) => {
  * @access  Public
  */
 const verifyEmail = asyncHandler(async (req, res, next) => {
-  console.log("inside verification email")
+  console.log("inside verification email");
   const { token } = req.query;
 
   const user = await User.findOne({ verificationToken: token });
   console.log("Verifying user:", user);
-  if (!user) throw new AppError('Invalid or expired verification token', 400);
+
+  if (!user) {
+    // invalid/expired token
+    return res.redirect("http://localhost:3000?verified=failed");
+  }
+
+  if (user.isVerified) {
+    // already verified
+    return res.redirect("http://localhost:3000?verified=already");
+  }
 
   user.isVerified = true;
   user.verificationToken = null;
   await user.save();
 
-  res.status(200).json({
-    status: 'success',
-    message: 'Email verified successfully. You can now log in.',
-  });
+  // success case
+  res.redirect("http://localhost:3000?verified=true");
 });
+
 
 const forgotPassword = asyncHandler(async (req, res, next) => {
   const { email } = req.body;
@@ -151,7 +165,7 @@ const forgotPassword = asyncHandler(async (req, res, next) => {
   await user.save({ validateBeforeSave: false });
 
   // Send email with RAW token (not hashed)
-  const resetUrl = `${process.env.CLIENT_URL}/reset-password?token=${resetToken}`;
+  const resetUrl = `http://localhost:3000/?token=${resetToken}`;
   await sendEmail(
     user.email,
     "Password Reset Request",
@@ -194,6 +208,188 @@ const resetPassword = asyncHandler(async (req, res, next) => {
   });
 });
 
+const googleAuthController = asyncHandler(async (req, res, next) => {
+  const { code } = req.body;
+  if (!code) {
+    res.status(400);
+    throw new Error("Authorization code is required");
+  }
+
+  // 1. Exchange code for tokens
+  const tokenResponse = await axios.post("https://oauth2.googleapis.com/token", null, {
+    params: {
+      code,
+      client_id: process.env.GOOGLE_CLIENT_ID,
+      client_secret: process.env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: process.env.GOOGLE_REDIRECT_URI,
+      grant_type: "authorization_code",
+    },
+  });
+
+  const { id_token, access_token } = tokenResponse.data;
+
+  // 2. Decode user info from ID token
+  const googleUser = jwt.decode(id_token);
+
+  if (!googleUser || !googleUser.email) {
+    res.status(400);
+    throw new Error("Invalid Google token");
+  }
+
+  // 3. Find or create user in DB
+  let user = await User.findOne({ email: googleUser.email });
+  if (!user) {
+    user = await User.create({
+      name: googleUser.name,
+      email: googleUser.email,
+      googleId: googleUser.sub,
+      avatar: googleUser.picture,
+    });
+  }
+
+  // 4. Generate our JWTs
+  const ourAccessToken = jwt.sign(
+    { userId: user._id, email: user.email },
+    process.env.JWT_SECRET,
+    { expiresIn: "15m" }
+  );
+
+  const ourRefreshToken = jwt.sign(
+    { userId: user._id },
+    process.env.JWT_REFRESH_SECRET,
+    { expiresIn: "7d" }
+  );
+
+  // (Optional) Save refresh token in DB
+  user.refreshToken = ourRefreshToken;
+  await user.save();
+
+  // 5. Respond with tokens + user info
+  res.json({
+    message: "Google login successful",
+    accessToken: ourAccessToken,
+    refreshToken: ourRefreshToken,
+    user: {
+      id: user._id,
+      name: user.name,
+      email: user.email,
+      avatar: user.avatar,
+    },
+  });
+});
+
+const socialAuthController = asyncHandler(async (req, res) => {
+  const { provider } = req.params;
+  const { code } = req.body;
+
+  if (!code) {
+    res.status(400);
+    throw new Error("Authorization code is required");
+  }
+
+  // 1. Load provider config
+  const config = providers[provider];
+  if (!config) {
+    res.status(400);
+    throw new Error("Unsupported provider");
+  }
+
+  // 2. Exchange code for tokens
+  const tokens = await exchangeCodeForToken({
+    ...config,
+    code,
+    provider,
+  });
+
+  // 3. Get normalized profile
+  const profile = await getUserProfile(provider, tokens);
+
+  if (!profile.email) {
+    res.status(400);
+    throw new Error(`${provider} did not return an email`);
+  }
+
+  // 4. Find or create user in DB
+  let user = await User.findOne({ email: profile.email });
+  if (!user) {
+    user = await User.create({
+      name: profile.name,
+      email: profile.email,
+      [`${provider}Id`]: profile.id, // e.g. googleId, githubId
+      avatar: profile.avatar,
+    });
+  }
+
+  // 5. Issue our JWTs
+  const accessToken = jwt.sign(
+    { userId: user._id, email: user.email },
+    process.env.JWT_SECRET,
+    { expiresIn: "15m" }
+  );
+
+  const refreshToken = jwt.sign(
+    { userId: user._id },
+    process.env.JWT_REFRESH_SECRET,
+    { expiresIn: "7d" }
+  );
+
+  user.refreshToken = refreshToken;
+  await user.save();
+
+  // 6. Respond with tokens only
+  res.json({
+    message: `${provider} login successful`,
+    accessToken,
+    refreshToken,
+  });
+});
+
+
+const refreshTokenController = asyncHandler(async (req, res) => {
+  const { refreshToken } = req.body;
+
+  if (!refreshToken) {
+    throw new AppError("Refresh token required", 401);
+  }
+
+  // Verify refresh token
+  let decoded;
+  try {
+    decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+  } catch (err) {
+    throw new AppError("Invalid or expired refresh token", 403);
+  }
+
+  // Find user
+  const user = await User.findById(decoded.userId);
+  if (!user || user.refreshToken !== refreshToken) {
+    throw new AppError("Invalid refresh token", 403);
+  }
+
+  // Issue new access token
+  const newAccessToken = jwt.sign(
+    { userId: user._id, email: user.email },
+    process.env.JWT_SECRET,
+    { expiresIn: "15m" }
+  );
+
+  res.json({ accessToken: newAccessToken });
+});
+
+
+const logout = asyncHandler(async (req, res) => {
+  const userId = req.user?.userId;
+
+  if (userId) {
+    const user = await User.findById(userId);
+    if (user) {
+      user.refreshToken = null; // invalidate refresh token
+      await user.save();
+    }
+  }
+
+  res.json({ message: "✅ Logged out successfully" });
+});
 
 
 
@@ -203,5 +399,8 @@ module.exports = {
   profile,
   verifyEmail,
   forgotPassword,
-  resetPassword
+  resetPassword,
+  refreshTokenController,
+  socialAuthController,
+  logout
 };
